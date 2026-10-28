@@ -1,0 +1,35 @@
+{
+  "primary": "a",
+  "accounts": [
+    {
+      "id": "a",
+      "label": "first subscription",
+      "configDir": "~/.claude",
+      "default": true,
+      "_comment": "default layout: CLAUDE_CONFIG_DIR stays UNSET, so its json is ~/.claude.json (NOT ~/.claude/.claude.json) and its Keychain service is the un-suffixed 'Claude Code-credentials'."
+    },
+    {
+      "id": "b",
+      "label": "second subscription",
+      "configDir": "~/.claude-b",
+      "_comment": "non-default: launched with CLAUDE_CONFIG_DIR=<dir>. It has its own Keychain item, Claude Code-credentials-<sha256(dir)[:8]>, so its normal login is used. Optional tokenRef (a 1Password CLI secret reference) is only a fallback for hosts with no Keychain; a `claude setup-token` token cannot read /api/oauth/usage."
+    }
+  ],
+  "share": {
+    "_comment": "Paths under the config dir that are account-agnostic. Every non-primary seat gets a symlink to the primary's copy. Never list .credentials.json or .claude.json here.",
+    "links": [
+      "settings.json",
+      "CLAUDE.md",
+      "hooks",
+      "skills",
+      "commands",
+      "agents",
+      "plugins",
+      "projects"
+    ],
+    "_comment2": "Keys inside <configDir>/.claude.json copied from the primary to the others. mcpServers is user-scope MCP; settings.json cannot hold it.",
+    "syncKeys": [
+      "mcpServers"
+    ]
+  }
+}

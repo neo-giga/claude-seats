@@ -1,0 +1,10 @@
+# local config and state: never commit these
+accounts.json
+accounts.json.tmp
+state.json
+state.json.tmp
+tokens/
+runtime/
+__pycache__/
+*.log
+REPORT.md

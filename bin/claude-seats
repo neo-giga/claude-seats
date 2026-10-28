@@ -1,0 +1,1668 @@
+#!/usr/bin/env python3
+"""claude-seats - run Claude Code across several Claude subscriptions ("seats").
+
+    claude-seats [claude args...]        start on the seat with the most headroom, supervise it
+    claude-seats --account b [args]      pin a seat
+    claude-seats --status                seats, login state, recorded limits
+    claude-seats --usage [--raw]         live 5-hour / weekly / weekly-model numbers per seat
+    claude-seats --sync                  re-link shared config, re-copy mcpServers (every seat)
+    claude-seats --add <id> <dir>        register a seat (prints the login line; never runs it)
+    claude-seats --connectors            claude.ai connectors each seat still has to authorize
+    claude-seats --clear [id]            forget recorded limits
+
+Each seat is a separate CLAUDE_CONFIG_DIR with its own official login. Everything
+account-agnostic (settings, hooks, skills, commands, agents, plugins, project history)
+is symlinked from the primary seat; user-scope MCP servers are key-synced because
+settings.json cannot hold them.
+
+Switching: claude-seats stays alive as a supervisor around the official `claude`
+binary. A Stop / StopFailure hook, injected only into claude-seats sessions through a
+merged --settings overlay, reports when the running seat is spent or near its limit and
+then WAITS for the supervisor's decision; while it waits no new turn can start. The
+supervisor ends claude (SIGTERM, which restores the terminal) only while that hook is
+still waiting, and restarts claude on the seat with the most headroom with
+`--resume <same session id>`. "Stay" releases the hook and the session goes on.
+
+Tokens are never copied, moved, refreshed or proxied by this program. A seat's
+expired access token is refreshed only by running the official binary on that seat.
+"""
+import datetime
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+ROOT = os.path.expanduser(os.environ.get("CLAUDE_SEATS_ROOT") or "~/.claude-accounts")
+REG = os.path.join(ROOT, "accounts.json")
+STATE = os.path.join(ROOT, "state.json")
+RUNTIME = os.path.join(ROOT, "runtime")
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+DEFAULT_COOLDOWN = 60 * 60  # 1h, then re-probe; the real window is rolling
+DEFAULT_HANDOFF_AT = 95     # percent of the tightest bucket
+USAGE_TTL = int(os.environ.get("CLAUDE_SEATS_USAGE_TTL") or 120)   # at most one API read per seat per 2 min
+REFRESH_COOLDOWN = 600      # one official-binary refresh attempt per seat per 10 min
+HANDOFF_COOLDOWN = 30       # never two handoffs within 30 s
+HOOK_WAIT = 8.0             # seconds a hook waits for the supervisor's decision, then fails open
+HOOK_TIMEOUT = 30           # the hook's timeout in the settings overlay (> HOOK_WAIT + parent-death wait)
+PREFETCH_EVERY = 60         # background usage prefetch so a handoff decision never waits on the API
+SCOPED_MODEL = (os.environ.get("CLAUDE_SEATS_SCOPED_MODEL") or "fable").lower()  # the model with its own weekly cap
+CONTINUE_PROMPT = ("Your previous turn was cut off by a usage limit and this conversation has been moved to "
+                   "another account. Continue the task you were working on; do not repeat work that is already done.")
+DEFAULT_SHARE = {
+    "links": ["settings.json", "CLAUDE.md", "hooks", "skills", "commands", "agents", "plugins", "projects"],
+    "syncKeys": ["mcpServers"],
+}
+# Escape sequences that undo what the Claude Code TUI turns on (mouse, bracketed paste,
+# kitty keyboard, modifyOtherKeys, cursor). Written after a forced kill and on exit.
+TERMINAL_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1016l\x1b[?1004l\x1b[?2004l"
+                  "\x1b[?2031l\x1b[<u\x1b[>4;0m\x1b[?25h\x1b(B\x0f\x1b[0m")
+
+
+def env_flag(*names, default=""):
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and v != "":
+            return v
+    return default
+
+
+def handoff_enabled():
+    return env_flag("CLAUDE_SEATS_HANDOFF", "CC_HANDOFF", default="on").lower() not in ("off", "0", "false", "no")
+
+
+def handoff_threshold():
+    try:
+        return float(env_flag("CLAUDE_SEATS_HANDOFF_AT", "CC_HANDOFF_AT", default=str(DEFAULT_HANDOFF_AT)))
+    except ValueError:
+        return float(DEFAULT_HANDOFF_AT)
+
+
+def warn(msg):
+    print("claude-seats: " + msg, file=sys.stderr, flush=True)
+
+
+def own_path():
+    return os.path.realpath(os.path.abspath(sys.argv[0]))
+
+
+class LaunchError(Exception):
+    """A configuration problem that must stop the launch with a clear message."""
+
+
+# ---------------------------------------------------------------- the official binary
+def find_claude(path_env=None, me=None):
+    """Absolute path of the official `claude` binary: the first PATH entry named claude
+    whose real file is not this launcher. CLAUDE_SEATS_CLAUDE_BIN overrides."""
+    me = os.path.realpath(me or own_path())
+    override = os.environ.get("CLAUDE_SEATS_CLAUDE_BIN")
+    cands = [override] if override else []
+    for d in (path_env if path_env is not None else os.environ.get("PATH", "")).split(os.pathsep):
+        if d:
+            cands.append(os.path.join(d, "claude"))
+    for c in cands:
+        if not c or not os.path.isfile(c) or not os.access(c, os.X_OK):
+            continue
+        real = os.path.realpath(c)
+        if real == me:
+            continue
+        return real
+    raise LaunchError("no official `claude` binary found on PATH that is not this launcher "
+                      "(set CLAUDE_SEATS_CLAUDE_BIN=/path/to/claude)")
+
+
+_CLAUDE_BIN = None
+
+
+def claude_bin():
+    global _CLAUDE_BIN
+    if _CLAUDE_BIN is None:
+        _CLAUDE_BIN = find_claude()
+    return _CLAUDE_BIN
+
+
+# ---------------------------------------------------------------- registry
+def reg():
+    try:
+        with open(REG) as f:
+            r = json.load(f)
+    except FileNotFoundError:
+        sys.exit("claude-seats: no %s - run `claude-seats --add <id> <config-dir>` or copy accounts.example.json" % REG)
+    for a in r["accounts"]:
+        a["dir"] = os.path.expanduser(a["configDir"])
+        # The default seat runs with CLAUDE_CONFIG_DIR unset, and its config JSON
+        # then lives at ~/.claude.json - not inside the config dir.
+        a["json"] = (os.path.expanduser("~/.claude.json") if a.get("default")
+                     else os.path.join(a["dir"], ".claude.json"))
+    r.setdefault("share", DEFAULT_SHARE)
+    return r
+
+
+def acct(r, aid):
+    for a in r["accounts"]:
+        if a["id"] == aid:
+            return a
+    sys.exit("claude-seats: unknown seat id %r" % aid)
+
+
+def save_reg(r):
+    out = {k: v for k, v in r.items()}
+    out["accounts"] = [{k: v for k, v in a.items() if k not in ("dir", "json")} for a in r["accounts"]]
+    tmp = REG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(out, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, REG)
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {"limits": {}}
+    except Exception:
+        return {"limits": {}}
+
+
+def save_state(s):
+    os.makedirs(ROOT, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def write_json(path, obj, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- credentials (read-only)
+def op_read(ref):
+    """Resolve a 1Password CLI secret reference. Returns the secret or None; never logs it."""
+    try:
+        out = subprocess.run(["op", "read", ref], capture_output=True, text=True, timeout=30)
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def keychain_service(a):
+    """macOS Keychain service name holding this seat's login.
+
+    The default config dir uses "Claude Code-credentials"; any other
+    CLAUDE_CONFIG_DIR appends "-" + the first 8 hex of sha256 over the config dir
+    path. Seats therefore get separate Keychain items.
+    """
+    base = "Claude Code-credentials"
+    if a.get("default"):
+        return base
+    return base + "-" + hashlib.sha256(a["dir"].encode()).hexdigest()[:8]
+
+
+def keychain_creds(a):
+    """The seat's stored OAuth record (read-only), or None."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", keychain_service(a), "-w"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            d = json.loads(out.stdout.strip())
+            c = d.get("claudeAiOauth") if isinstance(d, dict) else None
+            return c if isinstance(c, dict) and c else None
+    except Exception:
+        pass
+    return None
+
+
+def file_creds(a):
+    p = os.path.join(a["dir"], ".credentials.json")
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        c = d.get("claudeAiOauth") if isinstance(d, dict) else None
+        return c if isinstance(c, dict) and c else None
+    except Exception:
+        return None
+
+
+def stored_creds(a):
+    return keychain_creds(a) or file_creds(a)
+
+
+def _ms(v):
+    return v / 1000.0 if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def login_state(a, creds=None, now=None):
+    """none | ok | stale | expired.
+
+    stale   access token expired, refresh token alive: the official binary refreshes it on use.
+    expired refresh token expired too: only a new `claude auth login` helps.
+    """
+    now = now or time.time()
+    c = creds if creds is not None else stored_creds(a)
+    if not c or not isinstance(c, dict):
+        return "none"
+    exp = _ms(c.get("expiresAt")) or 0
+    rexp = _ms(c.get("refreshTokenExpiresAt"))
+    if not (c.get("accessToken") or c.get("refreshToken")):
+        # the binary blanks both tokens after a failed refresh and leaves the old expiry behind
+        return "expired" if (rexp and rexp < now) else "none"
+    if c.get("accessToken") and exp > now:
+        return "ok"
+    if c.get("refreshToken") and (rexp is None or rexp > now):
+        return "stale"
+    return "expired"
+
+
+def token_for(a):
+    """OAuth access token for ONE seat. Returns (token, source).
+
+    The seat's own stored login comes first: a token minted by `claude setup-token`
+    carries only user:inference, which /api/oauth/usage rejects. tokenRef stays as a
+    fallback for hosts with no Keychain.
+    """
+    c = keychain_creds(a)
+    if c and c.get("accessToken"):
+        return c["accessToken"], "keychain"
+    if a.get("tokenRef"):
+        tok = op_read(a["tokenRef"])
+        if tok:
+            return tok, "1password"
+    c = file_creds(a)
+    if c and c.get("accessToken"):
+        exp = _ms(c.get("expiresAt"))
+        if not exp or exp > time.time():
+            return c["accessToken"], "credentials.json"
+    return None, None
+
+
+def seat_env(a, base=None):
+    """Environment for running the official binary on this seat."""
+    env = dict(base if base is not None else os.environ)
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    if a.get("default"):
+        # The default seat must NOT set CLAUDE_CONFIG_DIR: its config JSON is ~/.claude.json
+        # and pointing the variable at ~/.claude makes Claude Code think it is logged out.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = a["dir"]
+    return env
+
+
+def refresh_command():
+    """The cheapest official turn that makes the binary refresh a seat's token. It never
+    persists a session, so it cannot become what `--continue` would pick up."""
+    return [claude_bin(), "-p", "Reply ok", "--model", "haiku", "--no-session-persistence"]
+
+
+def refresh_seat(a, reason=""):
+    """Let the OFFICIAL binary refresh a seat's expired access token by running the
+    cheapest possible turn on it. Nothing here touches the token itself. Once per seat
+    per REFRESH_COOLDOWN; disabled with CLAUDE_SEATS_REFRESH=off."""
+    if env_flag("CLAUDE_SEATS_REFRESH", default="on").lower() in ("off", "0", "false", "no"):
+        return False
+    stamp = os.path.join(RUNTIME, "refresh-%s.stamp" % a["id"])
+    try:
+        if time.time() - os.path.getmtime(stamp) < REFRESH_COOLDOWN:
+            return False
+    except OSError:
+        pass
+    os.makedirs(RUNTIME, exist_ok=True)
+    open(stamp, "w").close()
+    warn("seat %s: access token expired%s; letting `claude -p` refresh it (haiku, one short turn, not persisted)"
+         % (a["id"], " (" + reason + ")" if reason else ""))
+    import tempfile
+    probe_dir = tempfile.mkdtemp(prefix="claude-seats-refresh-")  # private cwd: no project history of yours is touched
+    try:
+        env = seat_env(a)
+        env["CLAUDE_SEATS_INSIDE"] = "refresh"
+        subprocess.run(refresh_command(), env=env, cwd=probe_dir,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        return True
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+def fetch_usage(a, allow_refresh=True):
+    """{ok, data, source, state} or {ok: False, reason, state, auth_failed?}.
+
+    auth_failed is definitive: the seat cannot authenticate right now and must not be
+    ranked as "unknown usage"."""
+    creds = stored_creds(a)
+    state = login_state(a, creds)
+    if state == "expired":
+        return {"ok": False, "auth_failed": True, "state": state,
+                "reason": "login expired (refresh token too) - log in again: "
+                          "CLAUDE_CONFIG_DIR=%s claude auth login" % a["dir"]}
+    if state == "stale" and allow_refresh and refresh_seat(a, "usage read"):
+        state = login_state(a)  # re-check after the official refresh
+        if state not in ("ok", "stale"):
+            return {"ok": False, "auth_failed": True, "state": state,
+                    "reason": "refresh failed; the binary logged the seat out - log in again"}
+    tok, src = token_for(a)
+    if not tok:
+        return {"ok": False, "auth_failed": True, "reason": "no readable token", "state": state}
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + tok,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+        if not isinstance(data, dict) or not isinstance(data.get("limits"), list):
+            return {"ok": False, "reason": "unexpected usage response shape", "state": state}
+        return {"ok": True, "source": src, "data": data, "state": state}
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300].decode(errors="replace")
+        if e.code == 401 and allow_refresh and refresh_seat(a, "HTTP 401"):
+            return fetch_usage(a, allow_refresh=False)
+        out = {"ok": False, "reason": "HTTP %d" % e.code, "body": body, "state": state}
+        if e.code in (401, 403):
+            out["auth_failed"] = True
+        return out
+    except Exception as e:
+        return {"ok": False, "reason": str(e), "state": state}
+
+
+def cached_usage(a, ttl=None):
+    """fetch_usage with an on-disk cache so a session reads the API at most once per TTL per seat."""
+    ttl = USAGE_TTL if ttl is None else ttl
+    path = os.path.join(RUNTIME, "usage", a["id"] + ".json")
+    c = read_json(path)
+    if isinstance(c, dict) and ttl > 0 and time.time() - c.get("ts", 0) < ttl and isinstance(c.get("usage"), dict):
+        return c["usage"]
+    u = fetch_usage(a)
+    try:
+        write_json(path, {"ts": time.time(), "usage": u})
+    except Exception:
+        pass
+    return u
+
+
+# ---------------------------------------------------------------- limits math
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def limit_report(usage):
+    """Summarise a seat's live limits, or None when the data is unusable.
+
+    /api/oauth/usage returns a `limits` list of
+    {kind, group, percent, severity, resets_at, scope:{model:{display_name}}, is_active}.
+    kind is session | weekly_all | weekly_scoped; weekly_scoped carries a per-model cap.
+    Entries of the wrong shape are skipped; a response without a list of limits is unavailable.
+    """
+    if not isinstance(usage, dict) or not usage.get("ok"):
+        return None
+    data = usage.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("limits"), list):
+        return None
+    out = {"scoped": None, "overall": None, "session": None, "blocked": [], "exhausted": []}
+    for e in data["limits"]:
+        if not isinstance(e, dict):
+            continue
+        pct = _num(e.get("percent"))
+        if pct is None:
+            continue  # an entry without a numeric percent says nothing usable
+        resets = e.get("resets_at") if isinstance(e.get("resets_at"), str) else None
+        rec = {"pct": pct, "resets_at": resets, "severity": e.get("severity"), "active": bool(e.get("is_active"))}
+        scope = e.get("scope") if isinstance(e.get("scope"), dict) else {}
+        mdl = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        model = mdl.get("display_name") if isinstance(mdl.get("display_name"), str) else ""
+        key = None
+        if e.get("kind") == "weekly_scoped" and model.lower() == SCOPED_MODEL:
+            key = "scoped"
+        elif e.get("kind") == "weekly_all":
+            key = "overall"
+        elif e.get("kind") == "session":
+            key = "session"
+        if key:
+            out[key] = rec
+        if pct is not None and pct >= 100:
+            out["blocked"].append(str(e.get("kind")) + ("(%s)" % model if model else ""))
+            if key:
+                out["exhausted"].append((key, resets))
+    out["fable"] = out["scoped"]  # historical name
+    return out
+
+
+BUCKET_NAMES = {"session": "5-hour", "overall": "weekly", "scoped": "weekly-" + SCOPED_MODEL}
+
+
+def tightest(rep, want_scoped=True):
+    """(pct, bucket-name, resets_at) of the fullest bucket that matters, or None."""
+    if not rep:
+        return None
+    keys = ["overall", "session"] + (["scoped"] if want_scoped else [])
+    cands = [(rep[k]["pct"], k, rep[k].get("resets_at")) for k in keys if rep.get(k) and rep[k].get("pct") is not None]
+    if not cands:
+        return None
+    pct, key, reset = max(cands, key=lambda t: t[0])
+    return pct, BUCKET_NAMES[key], reset
+
+
+def headroom(usage, want_fable=True):
+    """0..1 fraction left for the model we care about; None if unknown."""
+    t = tightest(limit_report(usage), want_fable)
+    if not t:
+        return None, None
+    return max(0.0, 1.0 - t[0] / 100.0), t[2]
+
+
+def want_scoped_for(model_hint):
+    """The scoped weekly cap matters when the session runs that model or the default model."""
+    m = (model_hint or "").lower()
+    return m == "" or m == "default" or SCOPED_MODEL in m
+
+
+def choose_seat(seats, current=None, threshold=DEFAULT_HANDOFF_AT, want_scoped=True, spent=(), force=None):
+    """Pure selection. seats: [{id, usable, usage (fetch_usage result or None), marked_until}].
+
+    Returns (chosen_id or None, rows) where rows describe every seat for the log:
+    {id, pct, bucket, resets_at, state}. A seat is a candidate when it is usable, not
+    marked, not in `spent`, its auth did not definitively fail, and its tightest bucket is
+    below `threshold`. Unknown usage (network trouble) counts as 50 % so a seat with known
+    headroom wins over a blind one. Ties keep the current seat. `force` names a seat to
+    return regardless (tests / --account).
+    """
+    rows, cands = [], []
+    now = time.time()
+    for s in seats:
+        row = {"id": s["id"], "pct": None, "bucket": None, "resets_at": None, "state": "ok"}
+        u = s.get("usage")
+        if not s.get("usable"):
+            row["state"] = "not logged in"
+        elif isinstance(u, dict) and u.get("auth_failed"):
+            row["state"] = "auth failed"
+            row["detail"] = u.get("reason")
+        else:
+            t = tightest(limit_report(u), want_scoped)
+            if t:
+                row["pct"], row["bucket"], row["resets_at"] = t
+            else:
+                row["state"] = "usage unknown"
+                if isinstance(u, dict) and not u.get("ok"):
+                    row["detail"] = u.get("reason")
+            if s.get("marked_until") and s["marked_until"] > now:
+                row["state"] = "marked spent"
+            elif s["id"] in spent:
+                row["state"] = "spent"
+            elif row["pct"] is not None and row["pct"] >= threshold:
+                row["state"] = "over threshold"
+            if row["state"] in ("ok", "usage unknown"):
+                rank = row["pct"] if row["pct"] is not None else 50.0
+                cands.append((rank, 0 if s["id"] == current else 1, s["id"]))
+        rows.append(row)
+    if force:
+        return force, rows
+    if not cands:
+        return None, rows
+    cands.sort()
+    return cands[0][2], rows
+
+
+def fmt_reset(iso):
+    ts = parse_ts(iso)
+    if ts is None:
+        return "reset unknown"
+    return "resets " + time.strftime("%a %H:%M", time.localtime(ts))
+
+
+def describe_rows(rows):
+    parts = []
+    for r in rows:
+        if r["pct"] is None:
+            parts.append("%s: %s" % (r["id"], r.get("detail") or r["state"]))
+        else:
+            parts.append("%s: %d%% (%s, %s)%s" % (r["id"], r["pct"], r["bucket"], fmt_reset(r["resets_at"]),
+                                                  "" if r["state"] == "ok" else " " + r["state"]))
+    return "; ".join(parts)
+
+
+# ---------------------------------------------------------------- sharing
+def link_seat(r, a, quiet=False):
+    """Symlink the primary's shared paths into ONE seat's config dir."""
+    prim = acct(r, r["primary"])
+    made = []
+    if a["id"] == prim["id"]:
+        return made
+    os.makedirs(a["dir"], exist_ok=True)
+    for name in r["share"]["links"]:
+        src = os.path.join(prim["dir"], name)
+        dst = os.path.join(a["dir"], name)
+        if not os.path.exists(src):
+            continue
+        if os.path.islink(dst):
+            if os.readlink(dst) == src:
+                continue
+            os.unlink(dst)
+        elif os.path.exists(dst):
+            if not quiet:
+                print("  skip %s/%s: real file/dir already there (move it aside first)" % (a["id"], name))
+            continue
+        os.symlink(src, dst)
+        made.append("%s/%s" % (a["id"], name))
+    return made
+
+
+def sync_seat(r, a, quiet=False):
+    """Copy the primary's syncKeys (mcpServers) into ONE seat's .claude.json."""
+    prim = acct(r, r["primary"])
+    if a["id"] == prim["id"]:
+        return []
+    src = read_json(prim["json"]) if os.path.exists(prim["json"]) else {}
+    src = src if isinstance(src, dict) else {}
+    os.makedirs(a["dir"], exist_ok=True)
+    tj = a["json"]
+    dst = read_json(tj) if os.path.exists(tj) else {}
+    dst = dst if isinstance(dst, dict) else {}
+    changed = []
+    for k in r["share"]["syncKeys"]:
+        if src.get(k) != dst.get(k):
+            dst[k] = src.get(k)
+            changed.append(k)
+    if changed:
+        tmp = tj + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(dst, f, indent=1)
+        os.replace(tmp, tj)
+        os.chmod(tj, 0o600)
+    if not quiet:
+        print("  %s: %s" % (a["id"], "synced " + ",".join(changed) if changed else "already in sync"))
+    return changed
+
+
+def cmd_link(r, args):
+    made = []
+    for a in r["accounts"]:
+        made += link_seat(r, a)
+    print("linked:", ", ".join(made) if made else "(nothing new)")
+
+
+def cmd_sync(r, args):
+    for a in r["accounts"]:
+        sync_seat(r, a)
+
+
+def cmd_add(r, args):
+    """Register a seat: create ITS config dir, link ITS shared config, print the login line.
+    Other seats are not touched (that is what --sync is for)."""
+    if len(args) < 2:
+        sys.exit("usage: claude-seats --add <id> <config-dir>")
+    aid, d = args[0], os.path.expanduser(args[1])
+    if r is None:
+        r = {"primary": aid, "accounts": [], "share": DEFAULT_SHARE}
+    if any(a["id"] == aid for a in r["accounts"]):
+        sys.exit("claude-seats: seat %r already exists" % aid)
+    is_default = os.path.realpath(d) == os.path.realpath(os.path.expanduser("~/.claude"))
+    row = {"id": aid, "label": args[2] if len(args) > 2 else aid, "configDir": args[1]}
+    if is_default:
+        row["default"] = True
+    r["accounts"].append(row)
+    os.makedirs(ROOT, exist_ok=True)
+    save_reg(r)
+    os.makedirs(d, exist_ok=True)
+    r = reg()
+    a = acct(r, aid)
+    made = link_seat(r, a)
+    sync_seat(r, a)
+    print("added seat %s -> %s%s" % (aid, d, " (default seat: CLAUDE_CONFIG_DIR stays unset)" if is_default else ""))
+    if made:
+        print("linked: " + ", ".join(made))
+    if not is_default:
+        print("log it in once (this program never does it for you):")
+        print("    CLAUDE_CONFIG_DIR=%s claude auth login" % d)
+
+
+# ---------------------------------------------------------------- recorded limits
+def parse_ts(s):
+    """ISO-8601 from the usage API -> epoch seconds, or None."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def mark(aid, scope="all", until=None, note=""):
+    """Record one exhausted bucket. scope: session | overall | scoped | all (every model)."""
+    s = load_state()
+    s.setdefault("limits", {}).setdefault(aid, {})[scope] = {
+        "until": until or (time.time() + DEFAULT_COOLDOWN),
+        "marked": time.time(),
+        "note": note,
+    }
+    save_state(s)
+
+
+def mark_native_limit(aid, want_scoped, usage, note=""):
+    """A native limit event (429 StopFailure or Claude Code's own parking record) marks ONLY the
+    buckets the API reports at 100 %, each with its own reset. When the API cannot answer (or
+    reports nothing spent yet), fall back to a one-hour mark scoped to the model the session was
+    using: `scoped` for the scoped model, `all` otherwise. Returns the scopes marked."""
+    rep = limit_report(usage)
+    marked = []
+    if rep and rep["exhausted"]:
+        for key, resets in rep["exhausted"]:
+            mark(aid, key, until=parse_ts(resets), note=(note + "; " if note else "") + "api: %s at 100%%" % BUCKET_NAMES[key])
+            marked.append(key)
+        return marked
+    scope = "scoped" if want_scoped else "all"
+    mark(aid, scope, note=(note + "; " if note else "") + "api unavailable, 1h fallback")
+    return [scope]
+
+
+def limited(aid, want_scoped=True):
+    """The recorded limit that still blocks this seat for the requested model, or None.
+
+    session / overall / all block every model; scoped (and the legacy "fable") only block
+    when the session needs the scoped model."""
+    s = load_state().get("limits", {}).get(aid, {})
+    if not isinstance(s, dict):
+        return None
+    now = time.time()
+    scopes = ["session", "overall", "all"] + (["scoped", "fable"] if want_scoped else [])
+    for sc in scopes:
+        e = s.get(sc)
+        if isinstance(e, dict) and _num(e.get("until")) and e["until"] > now:
+            return e
+    return None
+
+
+def cmd_clear(r, args):
+    s = load_state()
+    if args:
+        s.get("limits", {}).pop(args[0], None)
+    else:
+        s["limits"] = {}
+    save_state(s)
+    print("cleared")
+
+
+# ---------------------------------------------------------------- selection helpers
+def display(a):
+    """The seat's real email once it has logged in, else its configured label."""
+    try:
+        oa = read_json(a["json"]).get("oauthAccount") or {}
+        return oa.get("emailAddress") or a["label"]
+    except Exception:
+        return a["label"]
+
+
+def usable(a):
+    """A seat is usable only if the official binary can authenticate it.
+
+    A config dir is not enough - `--add` creates one before the seat is ever logged
+    in - and a login whose refresh token has expired is as good as none.
+    """
+    if not os.path.exists(a["json"]):
+        return False
+    return login_state(a) in ("ok", "stale")
+
+
+def seat_infos(r, probe=True, ttl=None, want_scoped=True):
+    """[{id, usable, usage, marked_until}] for choose_seat().
+
+    Usage is read first (it may trigger the official refresh), and the login state is
+    re-checked afterwards: a seat the refresh logged out is not usable."""
+    out = []
+    for a in r["accounts"]:
+        ok = usable(a)
+        u = cached_usage(a, ttl) if (ok and probe) else None
+        if ok and probe:
+            ok = usable(a)
+            if isinstance(u, dict) and u.get("auth_failed"):
+                ok = ok and False
+        st = limited(a["id"], want_scoped) if ok else None
+        out.append({"id": a["id"], "usable": ok, "usage": u, "marked_until": st["until"] if st else None})
+    return out
+
+
+def record_blocked(r, infos, want_scoped=True):
+    """Remember every bucket the API reports at 100 %, each with its own reset time."""
+    for s in infos:
+        rep = limit_report(s.get("usage"))
+        if rep and rep["exhausted"]:
+            for key, resets in rep["exhausted"]:
+                mark(s["id"], key, until=parse_ts(resets), note="usage api: %s at 100%%" % BUCKET_NAMES[key])
+            st = limited(s["id"], want_scoped)
+            s["marked_until"] = st["until"] if st else None
+
+
+# ---------------------------------------------------------------- reporting commands
+def cmd_status(r, args):
+    print("%-4s%-34s%-16s%-14s%s" % ("ID", "ACCOUNT", "CONFIG", "LOGIN", "LIMIT"))
+    todo = []
+    for a in r["accounts"]:
+        who = display(a)
+        cfg = "missing"
+        if os.path.exists(a["json"]):
+            oa = (read_json(a["json"]) or {}).get("oauthAccount") or {}
+            if isinstance(oa, dict) and oa.get("emailAddress"):
+                who, cfg = oa["emailAddress"], "logged in"
+            else:
+                cfg = "not logged in"
+        ls = login_state(a)
+        login = {"ok": "token ok", "stale": "token stale*", "expired": "LOGIN EXPIRED", "none": "NONE"}[ls]
+        lim = []
+        for sc, e in (load_state().get("limits", {}).get(a["id"], {}) or {}).items():
+            if isinstance(e, dict) and _num(e.get("until")) and e["until"] > time.time():
+                lim.append("%s spent until %s" % (BUCKET_NAMES.get(sc, sc), time.strftime("%a %H:%M", time.localtime(e["until"]))))
+        print("%-4s%-34s%-16s%-14s%s" % (a["id"] + ("*" if a["id"] == r["primary"] else " "), who, cfg, login,
+                                         ", ".join(lim) or "-"))
+        if cfg != "logged in" or ls in ("none", "expired"):
+            todo.append("seat %s: CLAUDE_CONFIG_DIR=%s claude auth login" % (a["id"], a["dir"])
+                        if not a.get("default") else "seat %s: claude auth login" % a["id"])
+    print("\n* = primary: the seat whose settings/hooks/skills/commands/plugins/projects the others symlink,")
+    print("  and the source of the mcpServers block copied into every other seat's .claude.json.")
+    print("  token stale* = access token expired, refresh token alive: `claude` refreshes it on its next run.")
+    if todo:
+        print("\nstill to do (run these yourself; claude-seats never logs in or out):")
+        for t in todo:
+            print("  - " + t)
+
+
+def cmd_usage(r, args):
+    for a in r["accounts"]:
+        u = fetch_usage(a) if usable(a) or login_state(a) != "none" else {"ok": False, "reason": "not logged in"}
+        if not u.get("ok"):
+            print(("%s: unavailable - %s %s" % (a["id"], u.get("reason"), u.get("body", ""))).rstrip())
+            continue
+        if "--raw" in args:
+            print("--- %s (token from %s) ---" % (a["id"], u["source"]))
+            print(json.dumps(u["data"], indent=1))
+            continue
+        rep = limit_report(u) or {}
+        print("%s  %s" % (a["id"], display(a)))
+        for name, key in (("5-hour session", "session"), ("weekly (all)", "overall"),
+                          ("weekly %s" % SCOPED_MODEL.capitalize(), "scoped")):
+            e = rep.get(key)
+            if not e or e.get("pct") is None:
+                print("    %-15s n/a" % name)
+                continue
+            when = ""
+            if e.get("resets_at"):
+                when = " · resets " + e["resets_at"].replace("T", " ")[:16] + "Z"
+            flag = "  <-- EXHAUSTED" if (e.get("pct") or 0) >= 100 else ""
+            print("    %-15s %3s%% used (%s)%s%s" % (name, e["pct"], e.get("severity"), when, flag))
+
+
+def cmd_connectors(r, args):
+    """Diff claude.ai connectors between the primary seat and the others.
+
+    Connector grants live server-side per Anthropic account, so they cannot be
+    synced - each seat has to authorize them once. This just says what is missing.
+    """
+    def ever(a):
+        d = read_json(a["json"]) or {}
+        v = d.get("claudeAiMcpEverConnected") if isinstance(d, dict) else None
+        return set(v) if isinstance(v, list) else set()
+    prim = acct(r, r["primary"])
+    base = ever(prim)
+    print("%s (%s) has %d connector(s):" % (prim["id"], display(prim), len(base)))
+    for c in sorted(base):
+        print("   ", c.replace("claude.ai ", ""))
+    for a in r["accounts"]:
+        if a["id"] == prim["id"]:
+            continue
+        missing = sorted(base - ever(a))
+        print("\n%s (%s) is missing %d:" % (a["id"], display(a), len(missing)))
+        for c in missing:
+            print("   ", c.replace("claude.ai ", ""))
+        if missing:
+            print("\n  Authorize them in a seat-%s session: claude-seats --account %s, then /mcp" % (a["id"], a["id"]))
+        d = read_json(a["json"]) or {}
+        servers = list((d.get("mcpServers") or {}).keys()) if isinstance(d, dict) and isinstance(d.get("mcpServers"), dict) else []
+        if servers:
+            print("  Also re-auth these MCP servers there via /mcp: " + ", ".join(servers))
+
+
+# ---------------------------------------------------------------- hook side (runs inside claude)
+def native_limit_record(d):
+    """True for the structured records Claude Code itself writes when a usage limit hits.
+
+    Observed 2026-10-03 (real transcript):
+      {"type":"system","subtype":"informational","level":"notice","content":"Usage limit reached · continuing automatically at 5pm · esc to cancel"}
+      {"type":"user","isMeta":true,"message":{"role":"user","content":"[Usage limit reached; a short grace allowance remains, ...]"}}
+    Ordinary user prompts (isMeta false/absent) and assistant text never qualify, whatever they say.
+    """
+    if not isinstance(d, dict):
+        return False
+    if d.get("type") == "system" and d.get("subtype") == "informational":
+        c = d.get("content")
+        return isinstance(c, str) and c.startswith("Usage limit reached")
+    if d.get("type") == "user" and d.get("isMeta") is True:
+        m = d.get("message")
+        c = m.get("content") if isinstance(m, dict) else None
+        return isinstance(c, str) and c.startswith("[Usage limit reached")
+    return False
+
+
+def transcript_limit_hit(path, since_ts, tail_bytes=400_000):
+    """The newest native usage-limit record newer than since_ts in the transcript tail, or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail_bytes))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return None
+    hit = None
+    for line in lines:
+        if "Usage limit reached" not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if not native_limit_record(d):
+            continue
+        ts = parse_ts(d.get("timestamp"))
+        if ts is None or ts < since_ts:
+            continue
+        text = d.get("content") if isinstance(d.get("content"), str) else d["message"]["content"]
+        hit = {"type": d.get("type"), "subtype": d.get("subtype"), "timestamp": d.get("timestamp"), "text": text[:160]}
+    return hit
+
+
+def evaluate_turn(payload, seat, usage, threshold, want_scoped, now=None, forced=False, transcript_since=None):
+    """Decide whether this turn boundary should trigger a handoff. Pure given its inputs.
+
+    Returns a request dict or None. `usage` is a fetch_usage result (may be None).
+    """
+    now = now or time.time()
+    ev = payload.get("hook_event_name")
+    base = {"ts": now, "event": ev, "seat": seat, "session_id": payload.get("session_id"),
+            "transcript_path": payload.get("transcript_path"), "cwd": payload.get("cwd")}
+    if ev == "StopFailure":
+        if payload.get("error") in ("rate_limit",):
+            return dict(base, reason="rate_limit", continue_turn=True,
+                        detail=payload.get("error_details") or payload.get("last_assistant_message") or "")
+        return None
+    if ev != "Stop":
+        return None
+    if forced:
+        return dict(base, reason="forced", continue_turn=False, detail="CLAUDE_SEATS_FORCE_LIMIT")
+    tp = payload.get("transcript_path")
+    if isinstance(tp, str) and tp and os.path.exists(tp):
+        hit = transcript_limit_hit(tp, transcript_since if transcript_since is not None else now - 1800)
+        if hit:
+            return dict(base, reason="usage_limit_reached", continue_turn=True, detail=hit["text"])
+    t = tightest(limit_report(usage), want_scoped)
+    if t and t[0] >= threshold:
+        return dict(base, reason="threshold", continue_turn=False, pct=t[0], bucket=t[1], resets_at=t[2],
+                    detail="%d%% (%s) >= %g%%" % (t[0], t[1], threshold))
+    return None
+
+
+def hook_paths(run_id):
+    base = os.path.join(RUNTIME, "events", run_id)
+    return base + ".json", base + ".decision.json", base + ".since"
+
+
+def await_decision(run_id, token, deadline, parent_pid, poll=0.1):
+    """Hook side of the handshake. Returns "stay" | "handoff" | "timeout".
+
+    Blocks the turn boundary until the supervisor answers. On "handoff" it keeps blocking
+    until claude (our parent) is gone, so no new turn starts under the SIGTERM. On timeout
+    it withdraws the request (fail-open) so the supervisor knows it must not kill.
+    """
+    req_path, dec_path, _ = hook_paths(run_id)
+    while time.time() < deadline:
+        d = read_json(dec_path)
+        if isinstance(d, dict) and d.get("token") == token:
+            if d.get("action") == "handoff":
+                end = time.time() + 15
+                while time.time() < end:
+                    try:
+                        os.kill(parent_pid, 0)
+                    except OSError:
+                        break
+                    if os.getppid() != parent_pid:
+                        break
+                    time.sleep(poll)
+                return "handoff"
+            for p in (req_path, dec_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            return "stay"
+        time.sleep(poll)
+    try:
+        os.remove(req_path)  # withdrawn: the turn is free to go on
+    except OSError:
+        pass
+    return "timeout"
+
+
+def cmd_hook(r, args):
+    """Stop / StopFailure hook body: evaluate, request, and wait for the decision.
+
+    Never prints, never exits non-zero: a broken hook must not break the session.
+    """
+    run_id = os.environ.get("CLAUDE_SEATS_RUN")
+    seat = os.environ.get("CLAUDE_SEATS_SEAT")
+    if not run_id or not seat:
+        return
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            return
+    except Exception:
+        return
+    try:
+        a = acct(r, seat)
+        want = want_scoped_for(os.environ.get("CLAUDE_SEATS_MODEL_HINT"))
+        forced = env_flag("CLAUDE_SEATS_FORCE_LIMIT").lower() in ("1", "on", "true", "yes", "once", seat)
+        headless = os.environ.get("CLAUDE_SEATS_MODE") == "print"
+        req_path, dec_path, since_path = hook_paths(run_id)
+        since = None
+        try:
+            since = float(open(since_path).read().strip())
+        except Exception:
+            pass
+        usage = None
+        if payload.get("hook_event_name") == "Stop" and not forced and not headless:
+            usage = cached_usage(a)  # headless runs only move on a real limit, never on the threshold (R5)
+        req = evaluate_turn(payload, seat, usage, handoff_threshold(), want, forced=forced, transcript_since=since)
+        if req and headless and req["reason"] == "threshold":
+            req = None
+        if not req:
+            return
+        parent = os.getppid()
+        token = str(uuid.uuid4())
+        deadline = time.time() + HOOK_WAIT
+        req.update({"token": token, "hook_pid": os.getpid(), "run_id": run_id,
+                    "gen": os.environ.get("CLAUDE_SEATS_GEN"), "expires_at": deadline})
+        try:
+            os.remove(dec_path)
+        except OSError:
+            pass
+        write_json(req_path, req)
+        await_decision(run_id, token, deadline, parent)
+    except SystemExit:
+        pass
+    except Exception as e:  # never break the session
+        try:
+            os.makedirs(RUNTIME, exist_ok=True)
+            with open(os.path.join(RUNTIME, "hook-errors.log"), "a") as f:
+                f.write("%s %s %r\n" % (time.strftime("%FT%T"), run_id, e))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- argv handling
+# Option arities from `claude --help` (2.1.312). 0 = flag, 1 = one value, "opt" = optional
+# value ([x]), "var" = variadic (<x...>, consumes until the next option). Options not in this
+# table make the argument list ambiguous: rotation is then turned off for the launch.
+OPTIONS = {
+    # value
+    "--agent": 1, "--agents": 1, "--append-system-prompt": 1, "--autocompact": 1, "--debug-file": 1,
+    "--effort": 1, "--environment": 1, "--fallback-model": 1, "--input-format": 1, "--json-schema": 1,
+    "--max-budget-usd": 1, "--model": 1, "--name": 1, "-n": 1, "--output-format": 1, "--permission-mode": 1,
+    "--permission-prompts": 1, "--plugin-dir": 1, "--plugin-url": 1, "--remote-control-session-name-prefix": 1,
+    "--session-id": 1, "--setting-sources": 1, "--settings": 1, "--system-prompt": 1, "--system-prompt-snapshot": 1,
+    # value, referenced by the help text but not listed (`--system-prompt[-file]`, `--permission-prompt-tool`)
+    "--system-prompt-file": 1, "--append-system-prompt-file": 1, "--permission-prompt-tool": 1, "--max-turns": 1,
+    # optional value
+    "--cloud": "opt", "--debug": "opt", "-d": "opt", "--from-pr": "opt", "--prompt-suggestions": "opt",
+    "--remote-control": "opt", "--resume": "opt", "-r": "opt", "--teleport": "opt", "--worktree": "opt", "-w": "opt",
+    "--tmux": "opt",
+    # variadic
+    "--add-dir": "var", "--allowedTools": "var", "--allowed-tools": "var", "--disallowedTools": "var",
+    "--disallowed-tools": "var", "--betas": "var", "--file": "var", "--mcp-config": "var", "--tools": "var",
+    # flags
+    "--allow-dangerously-skip-permissions": 0, "--ax-screen-reader": 0, "--bare": 0, "--bg": 0, "--background": 0,
+    "--brief": 0, "--chrome": 0, "--continue": 0, "-c": 0, "--dangerously-skip-permissions": 0, "--desktop": 0,
+    "--disable-slash-commands": 0, "--exclude-dynamic-system-prompt-sections": 0, "--fork-session": 0,
+    "--forward-subagent-text": 0, "--help": 0, "-h": 0, "--ide": 0, "--include-hook-events": 0,
+    "--include-partial-messages": 0, "--no-chrome": 0, "--no-session-persistence": 0, "--print": 0, "-p": 0,
+    "--replay-user-messages": 0, "--restricted": 0, "--safe-mode": 0, "--strict-mcp-config": 0, "--verbose": 0,
+    "--version": 0, "-v": 0,
+}
+
+
+def normalize_argv(argv):
+    """`--opt=value` -> `--opt value` for every known value-taking option, so one parser sees one shape."""
+    out = []
+    for a in argv:
+        if a.startswith("--") and "=" in a:
+            opt, val = a.split("=", 1)
+            if OPTIONS.get(opt) in (1, "opt", "var"):
+                out += [opt, val]
+                continue
+        out.append(a)
+    return out
+
+
+def parse_args(argv):
+    """What the supervisor needs to know about the caller's claude args (normalized form).
+
+    Fills `ambiguous` with a reason when the prompt cannot be told apart from option values:
+    an unknown option, or a variadic option with no positional anywhere else.
+    """
+    info = {"print": False, "model": None, "settings": None, "settings_idx": None, "session_id": None,
+            "resume": None, "continue": False, "stream": False, "prompt_idx": None, "fork": False,
+            "ambiguous": None, "positionals": []}
+    variadic_tail = None
+    i, n = 0, len(argv)
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            rest = argv[i + 1:]
+            if len(rest) > 1:
+                info["ambiguous"] = "more than one argument after `--`"
+            if rest:
+                info["prompt_idx"] = i + 1
+                info["positionals"].append(i + 1)
+            break
+        if not a.startswith("-") or a == "-":
+            info["positionals"].append(i)
+            i += 1
+            continue
+        arity = OPTIONS.get(a)
+        if arity is None:
+            info["ambiguous"] = "unknown option %s (not in `claude --help` 2.1.312)" % a
+            i += 1
+            continue
+        if a in ("-p", "--print"):
+            info["print"] = True
+        elif a in ("--continue", "-c"):
+            info["continue"] = True
+        elif a == "--fork-session":
+            info["fork"] = True
+        vals = []
+        if arity == 1:
+            if i + 1 < n:
+                vals = [argv[i + 1]]
+            i += 2
+        elif arity == "opt":
+            if i + 1 < n and not argv[i + 1].startswith("-"):
+                vals = [argv[i + 1]]
+                i += 2
+            else:
+                i += 1
+        elif arity == "var":
+            j = i + 1
+            while j < n and not argv[j].startswith("-"):
+                vals.append(argv[j])
+                j += 1
+            variadic_tail = (a, i + 1, j)
+            i = j
+        else:
+            i += 1
+        if a == "--model" and vals:
+            info["model"] = vals[0]
+        elif a == "--settings" and vals:
+            info["settings"], info["settings_idx"] = vals[0], i - 2
+        elif a == "--session-id" and vals:
+            info["session_id"] = vals[0]
+        elif a in ("--resume", "-r"):
+            info["resume"] = vals[0] if vals else ""
+        elif a in ("--output-format", "--input-format") and vals:
+            if vals[0] == "stream-json":
+                info["stream"] = True
+    if len(info["positionals"]) > 1:
+        info["ambiguous"] = info["ambiguous"] or "more than one positional argument"
+    if info["positionals"]:
+        info["prompt_idx"] = info["positionals"][0]
+    if variadic_tail and not info["positionals"] and variadic_tail[2] > variadic_tail[1]:
+        info["ambiguous"] = info["ambiguous"] or ("%s is variadic and the prompt may be its last value; "
+                                                  "put the prompt first or use `--`" % variadic_tail[0])
+    return info
+
+
+def resume_args(argv, sid, continue_turn):
+    """The caller's (normalized, unambiguous) args rewritten for a relaunch: same flags,
+    `--resume <sid>`, the prompt dropped (or replaced by the continue prompt when the limit cut
+    the turn), `--continue` / `--session-id` / `--fork-session` removed."""
+    info = parse_args(argv)
+    out, i, n = [], 0, len(argv)
+    while i < n:
+        a = argv[i]
+        if i == info["prompt_idx"]:
+            i += 1
+            continue
+        if a == "--":
+            i += 1
+            continue
+        if a in ("--continue", "-c", "--fork-session"):
+            i += 1
+            continue
+        arity = OPTIONS.get(a) if a.startswith("-") else None
+        if a in ("--session-id", "--resume", "-r"):
+            if arity == 1 or (i + 1 < n and not argv[i + 1].startswith("-")):
+                i += 2
+            else:
+                i += 1
+            continue
+        if arity == 1:
+            out += argv[i:i + 2]
+            i += 2
+        elif arity == "opt":
+            if i + 1 < n and not argv[i + 1].startswith("-"):
+                out += argv[i:i + 2]
+                i += 2
+            else:
+                out.append(a)
+                i += 1
+        elif arity == "var":
+            j = i + 1
+            while j < n and not argv[j].startswith("-"):
+                j += 1
+            out += argv[i:j]
+            i = j
+        else:
+            out.append(a)
+            i += 1
+    out += ["--resume", sid]
+    if continue_turn:
+        out.append(CONTINUE_PROMPT)
+    return out
+
+
+def load_settings_arg(value):
+    """A --settings value is a file path or a JSON string. Must be a JSON object."""
+    if value is None:
+        return {}
+    v = value.strip()
+    try:
+        if v.startswith("{") or v.startswith("["):
+            s = json.loads(v)
+        else:
+            with open(os.path.expanduser(v)) as f:
+                s = json.load(f)
+    except (OSError, ValueError) as e:
+        raise LaunchError("--settings %s: %s" % (value, e))
+    if not isinstance(s, dict):
+        raise LaunchError("--settings must be a JSON object, got %s" % type(s).__name__)
+    return s
+
+
+def validate_hooks(hooks):
+    """hooks must be an object of event -> list of matcher groups. None counts as empty."""
+    if hooks is None:
+        return {}
+    if not isinstance(hooks, dict):
+        raise LaunchError("--settings: `hooks` must be an object, got %s" % type(hooks).__name__)
+    for ev, groups in hooks.items():
+        if groups is None:
+            continue
+        if not isinstance(groups, list) or not all(isinstance(g, dict) for g in groups):
+            raise LaunchError("--settings: `hooks.%s` must be a list of objects" % ev)
+    return hooks
+
+
+def merged_settings(caller_settings, hook_cmd):
+    """Deep-merge our Stop/StopFailure hooks into the caller's --settings object.
+
+    Claude Code treats a repeated --settings flag as last-wins (verified 2026-10-28), so
+    this is the only way to add hooks without dropping the caller's own settings. The
+    caller's keys are copied verbatim; nothing is removed or weakened. Invalid shapes raise.
+    """
+    if caller_settings is None:
+        caller_settings = {}
+    if not isinstance(caller_settings, dict):
+        raise LaunchError("--settings must be a JSON object")
+    s = json.loads(json.dumps(caller_settings))
+    hooks = validate_hooks(s.get("hooks"))
+    s["hooks"] = hooks
+    for ev in ("Stop", "StopFailure"):
+        if hooks.get(ev) is None:
+            hooks[ev] = []
+    hooks["Stop"].append({"hooks": [{"type": "command", "command": hook_cmd, "timeout": HOOK_TIMEOUT}]})
+    hooks["StopFailure"].append(
+        {"matcher": "rate_limit", "hooks": [{"type": "command", "command": hook_cmd, "timeout": HOOK_TIMEOUT}]})
+    return s
+
+
+def hook_command():
+    return "%s %s --hook" % (shlex.quote(sys.executable), shlex.quote(own_path()))
+
+
+# ---------------------------------------------------------------- supervisor
+def log_handoff(entry):
+    os.makedirs(RUNTIME, exist_ok=True)
+    with open(os.path.join(RUNTIME, "handoffs.log"), "a") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def hook_still_waiting(req, req_path, now=None):
+    """May the supervisor end the child for this request? Only while the requesting hook is
+    alive, has not withdrawn its request, and its wait has not expired (with a safety margin)."""
+    now = now or time.time()
+    if not os.path.exists(req_path):
+        return False
+    if _num(req.get("expires_at")) is None or now > req["expires_at"] - 0.5:
+        return False
+    pid = req.get("hook_pid")
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+class Supervisor:
+    def __init__(self, r, argv, forced_seat=None):
+        self.r = r
+        self.raw_argv = list(argv)
+        self.argv = normalize_argv(argv)
+        self.info = parse_args(self.argv)
+        self.run_id = str(uuid.uuid4())
+        self.generation = 0
+        self.forced_seat = forced_seat
+        self.handoff = handoff_enabled() and not forced_seat
+        self.handoff_off_reason = None
+        if self.handoff and self.info["ambiguous"]:
+            self.handoff = False
+            self.handoff_off_reason = self.info["ambiguous"]
+        # Pass-through cases: nothing to resume, or a streaming protocol we must not sit in the middle of.
+        if self.handoff and "--no-session-persistence" in self.argv:
+            self.handoff = False
+            self.handoff_off_reason = "--no-session-persistence: nothing to resume (pass-through)"
+        if self.handoff and self.info["print"] and self.info["stream"]:
+            self.handoff = False
+            self.handoff_off_reason = "stream-json input/output: pass-through, no rerun"
+        self.threshold = handoff_threshold()
+        self.want_scoped = want_scoped_for(self.info["model"])
+        self.events, self.decision, self.since = hook_paths(self.run_id)
+        self.overlay = os.path.join(RUNTIME, "overlay-" + self.run_id + ".json")
+        self.sid = self.info["session_id"] or (self.info["resume"] or None)
+        self.child = None
+        self.killed_by_us = False
+        self.handoffs = 0
+        self.spent = set()
+        self.buffer_stdout = self.info["print"] and self.handoff  # rotation off = plain child, unbuffered
+        self.out_chunks = []
+        self.tty_attrs = None
+        self.caller_settings = load_settings_arg(self.info["settings"]) if self.handoff else None
+        if self.handoff:
+            validate_hooks(self.caller_settings.get("hooks"))
+            if self.caller_settings.get("disableAllHooks"):
+                self.handoff = False
+                self.handoff_off_reason = "--settings disables all hooks"
+                self.buffer_stdout = False
+        self._stop_prefetch = threading.Event()
+
+    # -- seat choice
+    def pick(self, current=None, spent=(), fresh=False):
+        # launch reads live numbers (once per session); handoffs reuse the cache the prefetcher keeps warm
+        infos = seat_infos(self.r, ttl=0 if fresh else None, want_scoped=self.want_scoped)
+        record_blocked(self.r, infos, self.want_scoped)
+        force = os.environ.get("CLAUDE_SEATS_FORCE_TARGET") or None
+        chosen, rows = choose_seat(infos, current=current, threshold=self.threshold, want_scoped=self.want_scoped,
+                                   spent=spent, force=force)
+        return chosen, rows
+
+    def first_seat(self):
+        if self.forced_seat:
+            return acct(self.r, self.forced_seat), None
+        chosen, rows = self.pick(fresh=True)
+        if chosen is None:
+            if not any(s["usable"] for s in seat_infos(self.r, probe=False)):
+                warn("no seat has usable credentials; falling back to the primary")
+                return acct(self.r, self.r["primary"]), rows
+            # every seat is at/over threshold: start on the one with the most room anyway
+            best = min((x for x in rows if x["pct"] is not None), key=lambda x: x["pct"], default=None)
+            warn("every seat is at or over %g%% - %s" % (self.threshold, describe_rows(rows)))
+            return acct(self.r, best["id"] if best else self.r["primary"]), rows
+        return acct(self.r, chosen), rows
+
+    def _prefetch_loop(self):
+        """Keep every seat's usage cache warm so a handoff decision never waits on the API."""
+        while not self._stop_prefetch.wait(PREFETCH_EVERY):
+            try:
+                seat_infos(self.r, want_scoped=self.want_scoped)
+            except Exception:
+                pass
+
+    # -- child control
+    def build_cmd(self, resume, continue_turn):
+        if not self.handoff:
+            return [claude_bin()] + list(self.raw_argv)  # pass-through: the caller's argv, untouched
+        if resume:
+            args = resume_args(self.argv, self.sid, continue_turn)
+        else:
+            args = list(self.argv)
+            if self.handoff and not self.sid and not self.info["continue"] and self.info["resume"] is None:
+                self.sid = str(uuid.uuid4())
+                args = ["--session-id", self.sid] + args
+        if self.handoff:
+            write_json(self.overlay, merged_settings(self.caller_settings, hook_command()))
+            idx = parse_args(args)["settings_idx"]
+            if idx is not None:
+                args[idx + 1] = self.overlay
+            else:
+                args = ["--settings", self.overlay] + args
+        return [claude_bin()] + args
+
+    def spawn(self, a, resume=False, continue_turn=False):
+        cmd = self.build_cmd(resume, continue_turn)
+        env = seat_env(a)
+        env["CLAUDE_SEATS_RUN"] = self.run_id
+        env["CLAUDE_SEATS_SEAT"] = a["id"]
+        env["CLAUDE_SEATS_ROOT"] = ROOT
+        env["CLAUDE_SEATS_INSIDE"] = self.run_id  # recursion guard: a launcher started under us refuses to run
+        self.generation += 1
+        env["CLAUDE_SEATS_GEN"] = str(self.generation)
+        if self.info["model"]:
+            env["CLAUDE_SEATS_MODEL_HINT"] = self.info["model"]
+        env["CLAUDE_SEATS_MODE"] = "print" if self.info["print"] else "interactive"
+        if resume and env.get("CLAUDE_SEATS_FORCE_LIMIT") == "once":
+            env.pop("CLAUDE_SEATS_FORCE_LIMIT")
+        if a.get("tokenRef") and login_state(a) == "none":
+            tok = op_read(a["tokenRef"])
+            if tok:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+        for p in (self.events, self.decision):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        os.makedirs(os.path.dirname(self.since), exist_ok=True)
+        with open(self.since, "w") as f:
+            f.write("%f" % time.time())
+        self.killed_by_us = False
+        self.out_chunks = []
+        # a resumed headless run carries its prompt on the command line; do not let it wait on stdin again
+        stdin = subprocess.DEVNULL if (resume and self.info["print"]) else None
+        self.child = subprocess.Popen(cmd, env=env, stdin=stdin, stdout=subprocess.PIPE if self.buffer_stdout else None,
+                                      preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+        if self.buffer_stdout:
+            t = threading.Thread(target=self._drain, args=(self.child.stdout,), daemon=True)
+            t.start()
+            self.drainer = t
+        return cmd
+
+    def _drain(self, pipe):
+        while True:
+            chunk = pipe.read1(65536) if hasattr(pipe, "read1") else pipe.read(65536)
+            if not chunk:
+                break
+            self.out_chunks.append(chunk)
+
+    def end_child(self, grace=10.0, req=None):
+        """End the child. With `req`, only while that hook is still holding the turn boundary
+        (re-checked immediately before the signal); returns False when it was not."""
+        if self.child is None or self.child.poll() is not None:
+            return False
+        if req is not None and not hook_still_waiting(req, self.events):
+            return False
+        self.killed_by_us = True
+        try:
+            self.child.send_signal(signal.SIGTERM)
+        except OSError:
+            return False
+        deadline = time.time() + grace
+        while self.child.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        if self.child.poll() is None:
+            self.child.kill()
+            self.child.wait()
+            self.restore_terminal()  # a killed TUI never got to reset the terminal
+        return True
+
+    # -- terminal
+    def save_terminal(self):
+        try:
+            import termios
+            if os.isatty(0):
+                self.tty_attrs = termios.tcgetattr(0)
+        except Exception:
+            self.tty_attrs = None
+
+    def restore_terminal(self):
+        if self.tty_attrs is None:
+            return
+        try:
+            import termios
+            termios.tcsetattr(0, termios.TCSADRAIN, self.tty_attrs)
+            if os.isatty(1):
+                os.write(1, TERMINAL_RESET.encode())
+        except Exception:
+            pass
+
+    def flush_stdout(self):
+        if self.buffer_stdout:
+            try:
+                self.drainer.join(timeout=5)
+            except Exception:
+                pass
+            sys.stdout.buffer.write(b"".join(self.out_chunks))
+            sys.stdout.flush()
+            self.out_chunks = []
+
+    def cleanup(self):
+        self._stop_prefetch.set()
+        for p in (self.overlay, self.events, self.decision, self.since):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    # -- handshake
+    def answer(self, req, action):
+        write_json(self.decision, {"token": req.get("token"), "action": action, "ts": time.time()})
+
+    def valid_request(self, req):
+        """The request must carry this run's id and the current child generation. The session
+        id it reports is then authoritative (a `--resume <name>` or `--fork-session` launch does
+        not know its uuid until the hook says so)."""
+        if not isinstance(req, dict) or not req.get("token") or "reason" not in req:
+            return False
+        if req.get("run_id") != self.run_id or req.get("gen") != str(self.generation):
+            return False
+        return True
+
+    # -- main loop
+    def run(self):
+        if not self.info["print"]:
+            self.save_terminal()
+        a, rows = self.first_seat()
+        if rows:
+            warn("seat %s  (%s) - %s" % (a["id"], a["dir"], describe_rows(rows)))
+        else:
+            warn("seat %s  (%s)" % (a["id"], a["dir"]))
+        if login_state(a) == "none" and not a.get("tokenRef"):
+            warn("seat %s is not logged in - run: CLAUDE_CONFIG_DIR=%s claude auth login" % (a["id"], a["dir"]))
+            return 1
+        if self.handoff:
+            warn("auto-handoff on at %g%% (CLAUDE_SEATS_HANDOFF=off to disable)" % self.threshold)
+        elif self.handoff_off_reason:
+            warn("auto-handoff OFF for this launch: %s" % self.handoff_off_reason)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to claude
+        for s in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(s, self._forward)
+        resume, continue_turn = False, False
+        last_handoff, last_notice = 0.0, 0.0
+        interactive = not self.info["print"]
+        if self.handoff:
+            threading.Thread(target=self._prefetch_loop, daemon=True).start()
+        try:
+            respawn = True
+            while True:
+                if respawn:
+                    self.spawn(a, resume, continue_turn)
+                respawn = True
+                decision = None
+                while decision is None:
+                    rc = self.child.poll()
+                    req = read_json(self.events) if (self.handoff and os.path.exists(self.events)) else None
+                    if req is None:
+                        if rc is not None:
+                            break
+                        time.sleep(0.2)
+                        continue
+                    if not self.valid_request(req):
+                        # not this child / session: release whoever wrote it and ignore
+                        self.answer(req, "stay")
+                        try:
+                            os.remove(self.events)
+                        except OSError:
+                            pass
+                        time.sleep(0.2)
+                        continue
+                    if interactive and rc is not None and not self.killed_by_us:
+                        break  # the user ended the session; a pending request no longer matters
+                    if req.get("session_id"):
+                        self.sid = req["session_id"]
+                    # a limit means the seat is spent for selection, whatever the numbers say
+                    if req["reason"] in ("rate_limit", "usage_limit_reached", "forced"):
+                        self.spent.add(a["id"])
+                    if req["reason"] in ("rate_limit", "usage_limit_reached"):
+                        mark_native_limit(a["id"], self.want_scoped, cached_usage(a, ttl=0),
+                                          note="%s in session %s" % (req["reason"], self.sid))
+                    chosen, rows = self.pick(current=a["id"], spent=self.spent)
+                    too_many = (not interactive) and self.handoffs >= len(self.r["accounts"]) - 1
+                    too_soon = time.time() - last_handoff < HANDOFF_COOLDOWN
+                    stay = chosen is None or (chosen == a["id"] and not os.environ.get("CLAUDE_SEATS_FORCE_TARGET"))
+                    if stay or too_many or too_soon:
+                        self.answer(req, "stay")  # release the turn boundary first
+                        why = req.get("detail") or req["reason"]
+                        if too_many:
+                            msg = "seat %s %s; %d handoff(s) already, giving up - %s" % (
+                                a["id"], why, self.handoffs, describe_rows(rows))
+                        elif too_soon:
+                            msg = "seat %s %s; handed off %ds ago, not again yet" % (
+                                a["id"], why, time.time() - last_handoff)
+                        else:
+                            msg = "seat %s %s; no seat with headroom - %s" % (a["id"], why, describe_rows(rows))
+                        if time.time() - last_notice > 600 or not interactive:
+                            last_notice = time.time()
+                            log_handoff({"ts": time.strftime("%FT%T%z"), "session": self.sid, "from": a["id"],
+                                         "to": None, "reason": req["reason"], "detail": req.get("detail"),
+                                         "seats": rows})
+                            warn(msg + (" - staying on seat %s" % a["id"] if interactive else ""))
+                        # never end the child here: the hook is released and the run reports when it exits
+                        continue
+                    self.answer(req, "handoff")
+                    decision = (chosen, req, rows)
+                if decision is None:
+                    # child ended on its own: that is the result
+                    self.flush_stdout()
+                    return self.child.returncode
+                chosen, req, rows = decision
+                # the hook must still be holding the turn boundary, re-checked right before the signal
+                if not self.end_child(req=req):
+                    log_handoff({"ts": time.strftime("%FT%T%z"), "session": self.sid, "from": a["id"], "to": None,
+                                 "reason": req["reason"], "detail": "hook released before the signal; not interrupting",
+                                 "seats": rows})
+                    warn("seat %s %s; the turn boundary passed before the decision - not interrupting, "
+                         "will retry at the next one" % (a["id"], req.get("detail") or req["reason"]))
+                    try:
+                        os.remove(self.events)
+                    except OSError:
+                        pass
+                    respawn = False
+                    continue
+                nxt = acct(self.r, chosen)
+                pct = req.get("pct")
+                where = ("%d%% (%s)" % (pct, req.get("bucket"))) if pct is not None else req["reason"]
+                warn("seat %s at %s -> %s, resuming %s%s" % (
+                    a["id"], where, nxt["id"], self.sid, " (continuing the cut turn)" if req.get("continue_turn") else ""))
+                log_handoff({"ts": time.strftime("%FT%T%z"), "session": self.sid, "from": a["id"], "to": nxt["id"],
+                             "reason": req["reason"], "detail": req.get("detail"), "pct": pct,
+                             "bucket": req.get("bucket"), "seats": rows, "cwd": req.get("cwd")})
+                self.handoffs += 1
+                last_handoff = time.time()
+                # a headless run that stopped early has no prompt left to answer: always continue it
+                a, resume, continue_turn = nxt, True, bool(req.get("continue_turn")) or not interactive
+        finally:
+            if self.child and self.child.poll() is None:
+                self.end_child()
+            if interactive:
+                self.restore_terminal()
+            self.cleanup()
+
+    def _forward(self, signum, frame):
+        if self.child and self.child.poll() is None:
+            try:
+                self.child.send_signal(signum)
+            except OSError:
+                pass
+        raise SystemExit(128 + signum)
+
+
+# ---------------------------------------------------------------- entry
+HELP = __doc__.split("\n\n")[1]
+
+
+def main(argv):
+    forced = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--account" and i + 1 < len(argv):
+            forced = argv[i + 1]; i += 2; continue
+        if a.startswith("--account="):
+            forced = a.split("=", 1)[1]; i += 1; continue
+        if a == "--status":
+            return cmd_status(reg(), argv[i + 1:])
+        if a == "--usage":
+            return cmd_usage(reg(), argv[i + 1:])
+        if a == "--sync":
+            r = reg(); cmd_link(r, []); cmd_sync(r, []); return
+        if a == "--connectors":
+            return cmd_connectors(reg(), argv[i + 1:])
+        if a == "--clear":
+            return cmd_clear(reg(), argv[i + 1:])
+        if a == "--add":
+            return cmd_add(reg() if os.path.exists(REG) else None, argv[i + 1:])
+        if a == "--hook":
+            return cmd_hook(reg(), argv[i + 1:])
+        if a == "--seats-help":
+            print(HELP); return
+        rest.append(a); i += 1
+    if os.environ.get("CLAUDE_SEATS_INSIDE"):
+        sys.exit("claude-seats: refusing to start inside a claude-seats session (CLAUDE_SEATS_INSIDE=%s); "
+                 "run the official `claude` binary directly here" % os.environ["CLAUDE_SEATS_INSIDE"])
+    try:
+        claude_bin()
+        r = reg()
+        for a in r["accounts"]:
+            link_seat(r, a, quiet=True)
+            sync_seat(r, a, quiet=True)
+        sup = Supervisor(r, rest, forced_seat=forced)
+    except LaunchError as e:
+        sys.exit("claude-seats: %s" % e)
+    rc = sup.run()
+    sys.exit(rc or 0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # `claude-seats --usage | head` ends quietly
+    main(sys.argv[1:])
